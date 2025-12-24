@@ -1,22 +1,38 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import initWasm, { WasmOrderbook } from '../wasm/kraken_wasm.js'
 
-const SYMBOL = 'BTC/USD'
+const SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'XRP/USD', 'ADA/USD']
 const DEPTH = 25
+
+// Precision settings for checksum calculation
+const SYMBOL_PRECISION = {
+  'BTC/USD': [1, 8],
+  'ETH/USD': [2, 8],
+  'SOL/USD': [2, 8],
+  'XRP/USD': [5, 8],
+  'ADA/USD': [6, 8],
+}
 
 export default function App() {
   const [status, setStatus] = useState('Initializing...')
   const [sdkReady, setSdkReady] = useState(false)
+  const [selectedSymbol, setSelectedSymbol] = useState('BTC/USD')
   const [imbalance, setImbalance] = useState(0)
   const [imbalanceHistory, setImbalanceHistory] = useState([])
   const [bids, setBids] = useState([])
   const [asks, setAsks] = useState([])
   const [stats, setStats] = useState({ bidVolume: 0, askVolume: 0, spread: 0, midPrice: 0 })
 
-  const bookRef = useRef(null)
+  const booksRef = useRef({})
   const wsRef = useRef(null)
   const messageQueueRef = useRef([])
   const processingRef = useRef(false)
+  const selectedSymbolRef = useRef(selectedSymbol)
+
+  // Keep ref in sync with state
+  useEffect(() => {
+    selectedSymbolRef.current = selectedSymbol
+  }, [selectedSymbol])
 
   // Process messages sequentially to avoid WASM borrow conflicts
   const processNextMessage = useCallback(() => {
@@ -24,10 +40,10 @@ export default function App() {
     if (messageQueueRef.current.length === 0) return
 
     processingRef.current = true
-    const data = messageQueueRef.current.shift()
+    const { symbol, data } = messageQueueRef.current.shift()
 
     try {
-      const book = bookRef.current
+      const book = booksRef.current[symbol]
       if (!book) {
         processingRef.current = false
         if (messageQueueRef.current.length > 0) setTimeout(processNextMessage, 0)
@@ -36,30 +52,33 @@ export default function App() {
 
       const result = book.apply_and_get(data, DEPTH)
 
+      // Only update UI if this is the currently selected symbol
       if (result && (result.msg_type === 'update' || result.msg_type === 'snapshot')) {
-        const topBids = result.bids || []
-        const topAsks = result.asks || []
+        if (symbol === selectedSymbolRef.current) {
+          const topBids = result.bids || []
+          const topAsks = result.asks || []
 
-        setBids(topBids)
-        setAsks(topAsks)
+          setBids(topBids)
+          setAsks(topAsks)
 
-        // Calculate volumes (SDK returns {price, qty} objects)
-        const bidVolume = topBids.reduce((sum, b) => sum + (b.qty || b[1] || 0), 0)
-        const askVolume = topAsks.reduce((sum, a) => sum + (a.qty || a[1] || 0), 0)
+          // Calculate volumes (SDK returns {price, qty} objects)
+          const bidVolume = topBids.reduce((sum, b) => sum + (b.qty || b[1] || 0), 0)
+          const askVolume = topAsks.reduce((sum, a) => sum + (a.qty || a[1] || 0), 0)
 
-        setStats({
-          bidVolume,
-          askVolume,
-          spread: result.spread || 0,
-          midPrice: result.mid_price || 0
-        })
+          setStats({
+            bidVolume,
+            askVolume,
+            spread: result.spread || 0,
+            midPrice: result.mid_price || 0
+          })
 
-        // Calculate imbalance: (bid - ask) / (bid + ask)
-        const total = bidVolume + askVolume
-        if (total > 0) {
-          const imb = (bidVolume - askVolume) / total
-          setImbalance(imb)
-          setImbalanceHistory(prev => [...prev.slice(-59), imb])
+          // Calculate imbalance: (bid - ask) / (bid + ask)
+          const total = bidVolume + askVolume
+          if (total > 0) {
+            const imb = (bidVolume - askVolume) / total
+            setImbalance(imb)
+            setImbalanceHistory(prev => [...prev.slice(-59), imb])
+          }
         }
       }
     } catch (e) {
@@ -72,8 +91,8 @@ export default function App() {
     }
   }, [])
 
-  const queueMessage = useCallback((data) => {
-    messageQueueRef.current.push(data)
+  const queueMessage = useCallback((symbol, data) => {
+    messageQueueRef.current.push({ symbol, data })
     // Prevent queue from growing too large
     if (messageQueueRef.current.length > 200) {
       messageQueueRef.current = messageQueueRef.current.slice(-100)
@@ -92,10 +111,13 @@ export default function App() {
       console.log('[HAVFLOW] SDK ready')
       setSdkReady(true)
 
-      // Create orderbook with correct precision for BTC/USD
-      const book = WasmOrderbook.with_depth(SYMBOL, DEPTH)
-      book.set_precision(1, 8) // BTC precision
-      bookRef.current = book
+      // Create orderbooks for all symbols with correct precision
+      SYMBOLS.forEach(sym => {
+        const book = WasmOrderbook.with_depth(sym, DEPTH)
+        const [pricePrecision, qtyPrecision] = SYMBOL_PRECISION[sym] || [2, 8]
+        book.set_precision(pricePrecision, qtyPrecision)
+        booksRef.current[sym] = book
+      })
 
       setStatus('Connecting...')
       const ws = new WebSocket('wss://ws.kraken.com/v2')
@@ -107,7 +129,7 @@ export default function App() {
         setStatus('Connected')
         ws.send(JSON.stringify({
           method: 'subscribe',
-          params: { channel: 'book', symbol: [SYMBOL], depth: DEPTH }
+          params: { channel: 'book', symbol: SYMBOLS, depth: DEPTH }
         }))
       }
 
@@ -115,8 +137,8 @@ export default function App() {
         if (!mounted) return
         try {
           const msg = JSON.parse(event.data)
-          if (msg.channel === 'book' && msg.data?.[0]?.symbol === SYMBOL) {
-            queueMessage(event.data)
+          if (msg.channel === 'book' && msg.data?.[0]?.symbol) {
+            queueMessage(msg.data[0].symbol, event.data)
           }
         } catch (e) {}
       }
@@ -132,9 +154,21 @@ export default function App() {
     return () => {
       mounted = false
       wsRef.current?.close()
-      try { bookRef.current?.free() } catch (e) {}
+      Object.values(booksRef.current).forEach(book => {
+        try { book.free() } catch (e) {}
+      })
     }
   }, [queueMessage])
+
+  // Handle symbol change - reset history for new symbol
+  const handleSymbolChange = (newSymbol) => {
+    setSelectedSymbol(newSymbol)
+    setImbalance(0)
+    setImbalanceHistory([])
+    setBids([])
+    setAsks([])
+    setStats({ bidVolume: 0, askVolume: 0, spread: 0, midPrice: 0 })
+  }
 
   const gaugePosition = ((imbalance + 1) / 2) * 100 // Convert -1..1 to 0..100
 
@@ -154,7 +188,21 @@ export default function App() {
             SDK
           </span>
         </div>
-        <div style={styles.symbol}>{SYMBOL}</div>
+        <div style={styles.symbolSelector}>
+          {SYMBOLS.map(sym => (
+            <button
+              key={sym}
+              style={{
+                ...styles.symbolBtn,
+                background: selectedSymbol === sym ? '#00D9FF' : 'transparent',
+                color: selectedSymbol === sym ? '#0a0e14' : '#b3b1ad',
+              }}
+              onClick={() => handleSymbolChange(sym)}
+            >
+              {sym.split('/')[0]}
+            </button>
+          ))}
+        </div>
         <div style={styles.statusBar}>
           <span style={{
             ...styles.statusDot,
@@ -166,7 +214,7 @@ export default function App() {
 
       <div style={styles.content}>
         <div style={styles.gaugeContainer}>
-          <h2 style={styles.sectionTitle}>ORDER FLOW IMBALANCE</h2>
+          <h2 style={styles.sectionTitle}>ORDER FLOW IMBALANCE — <span style={{ color: '#FFD700' }}>{selectedSymbol}</span></h2>
 
           <div style={styles.gaugeWrapper}>
             <div style={styles.gaugeLabels}>
@@ -240,13 +288,13 @@ export default function App() {
           <div style={styles.statCard}>
             <div style={styles.statLabel}>BID VOLUME</div>
             <div style={{ ...styles.statValue, color: '#00FF88' }}>
-              {stats.bidVolume.toFixed(4)} BTC
+              {stats.bidVolume.toFixed(4)} {selectedSymbol.split('/')[0]}
             </div>
           </div>
           <div style={styles.statCard}>
             <div style={styles.statLabel}>ASK VOLUME</div>
             <div style={{ ...styles.statValue, color: '#FF4444' }}>
-              {stats.askVolume.toFixed(4)} BTC
+              {stats.askVolume.toFixed(4)} {selectedSymbol.split('/')[0]}
             </div>
           </div>
           <div style={styles.statCard}>
@@ -331,10 +379,19 @@ const styles = {
     letterSpacing: '4px',
     margin: 0,
   },
-  symbol: {
-    color: '#FFD700',
-    fontSize: '18px',
+  symbolSelector: {
+    display: 'flex',
+    gap: '8px',
+  },
+  symbolBtn: {
+    padding: '6px 12px',
+    border: '1px solid #2a2e38',
+    borderRadius: '4px',
+    cursor: 'pointer',
+    fontSize: '12px',
     fontWeight: 'bold',
+    fontFamily: "'SF Mono', monospace",
+    transition: 'all 0.2s',
   },
   statusBar: {
     display: 'flex',
