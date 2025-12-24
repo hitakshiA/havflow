@@ -1,5 +1,7 @@
 # Havflow - Order Flow Imbalance Visualizer
 
+**Live Demo: [https://havflow.vercel.app](https://havflow.vercel.app)**
+
 A real-time order flow imbalance analyzer for BTC/USD, powered by the [Havklo SDK](https://github.com/hitakshiA/Havklo_sdk).
 
 ## What This Demonstrates
@@ -36,7 +38,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173 in your browser.
+Open http://localhost:5173 in your browser, or visit the [live demo](https://havflow.vercel.app).
 
 ## How It Works
 
